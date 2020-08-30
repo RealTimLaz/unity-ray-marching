@@ -1,0 +1,273 @@
+﻿#include "UnityCG.cginc"
+#include "ShapeDefinitions.cginc"
+#include "FractalDefinitions.cginc"
+#include "ShapeTransforms.cginc"
+#include "Lighting.cginc"
+
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+#define MAX_DISTANCE _CameraFarClippingPlane + 1
+#define MAX_F_VALUE 3.402823466e+38F
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+Texture2D<float4> Source;
+RWTexture2D<float4> Destination;
+
+Texture2D<float4> _DepthTexture;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+float3 _CameraPosition;
+
+int _MaxSteps;
+float _Precision;
+
+float _CameraNearClippingPlane;
+float _CameraFarClippingPlane;
+
+struct Ray {
+    float3 origin;
+    float3 direction;
+};
+
+struct HitInfo {
+    Shape shape;
+    float dst;
+};
+
+StructuredBuffer<Shape> shapes;
+int numShapes;
+
+StructuredBuffer<AdvancedTransform> advancedTransforms;
+
+StructuredBuffer<Light> lights;
+int numLights;
+
+
+Ray CreateRay(float3 origin, float3 direction) {
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv) {
+    float3 origin = mul(_CameraToWorld, float4(0, 0, 0, 1)).xyz;
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0, 1)).xyz;
+    
+    direction = mul(_CameraToWorld, float4(direction, 0)).xyz;
+    //direction = normalize(direction);
+    return CreateRay(origin, direction);
+}
+
+
+float GetShapeDistance(Shape shape, float3 p, inout int transformIndex) {
+
+    p = TranslateRotate(p, shape.transformMatrix);
+    p = ScaleBefore(p, shape.size);
+
+    if (shape.numTransforms > 0) {
+        for (int i = 0; i < shape.numTransforms; i++) {
+            AdvancedTransform t = advancedTransforms[transformIndex];
+            if (t.transformType == 0) {
+                // Twist
+                p = Twist(p, t.scale);
+            }
+            else if (t.transformType == 1) {
+                // Bend
+                p = Bend(p, t.scale);
+            }
+            else if (t.transformType == 2) {
+                // Repeat
+                p = Repeat(p, t.scale);
+            }
+            else {
+                p = p;
+            }
+            transformIndex++;
+        }
+        
+    }
+
+    float dst = MAX_DISTANCE;
+
+    //sphere
+    if (shape.shapeType == 0) {
+        dst = sdSphere(p);
+    }
+    //cube
+    else if (shape.shapeType == 1) {
+        dst = sdBox(p);
+    }
+    //torus
+    else if (shape.shapeType == 2) {
+        dst = sdTorus(p, float2(shape.size.x, shape.size.y));
+    }
+    else if (shape.shapeType == 3) {
+        dst = sdMandelbulb(p);
+    }
+    else {
+        dst = MAX_DISTANCE;
+    }
+
+    dst = ScaleAfter(dst, shape.size);
+    return dst;
+}
+
+HitInfo SceneFunction(float3 p) {
+
+    int transformIndex = 0;
+
+    HitInfo h;
+    h.dst = MAX_DISTANCE;
+
+    float min_value = MAX_F_VALUE;
+
+    for (int i = 0; i < numShapes; i++) {
+        Shape shape = shapes[i];
+        float dst = GetShapeDistance(shape, p, transformIndex);
+
+        if (dst < min_value) {
+            h.shape = shape;
+            h.dst = dst;
+            min_value = dst;
+        }
+    }
+
+    return h;
+}
+
+float3 CalculateNormal(float3 p) {
+    float2 epsilon = float2(0.001f, 0.0f);
+
+    float3 normal = float3(
+        SceneFunction(p + epsilon.xyy).dst - SceneFunction(p - epsilon.xyy).dst,
+        SceneFunction(p + epsilon.yxy).dst - SceneFunction(p - epsilon.yxy).dst,
+        SceneFunction(p + epsilon.yyx).dst - SceneFunction(p - epsilon.yyx).dst
+    );
+
+    return normalize(normal);
+
+}
+
+float3 CalculateLighting(float3 p, Shape s) {
+
+    
+
+    float3 color = s.color;
+    float roughness = s.roughness;
+    float metalness = s.metalness;
+
+    
+
+    float3 N = CalculateNormal(p);
+    float3 V = normalize(_CameraPosition - p);
+
+    float3 Lo = float3(0, 0, 0);
+    
+    for (int i = 0; i < numLights; i++) {
+        
+        float3  lightColor = lights[i].radiance;
+
+        float distance = 1.0f;
+
+        float3 F0 = float3(0.04, 0.04, 0.04);
+        F0 = mix(F0, color, metalness);
+        
+
+        float3 L = normalize(-lights[i].position);
+
+        if (!lights[i].isDirectional) {
+            L = lights[i].position - p;
+            distance = length(L);
+            L = normalize(L);
+        }
+
+        float3 H = normalize(V + L);
+        float attenuation = 1.0 / (distance * distance);
+        float3 radiance = attenuation * lightColor;
+
+        
+
+        float NDF = DistributionGGX(N, H, roughness);
+        float G = GeometrySmith(N, V, L, roughness);
+        float3 F = fresnelSchlik(max(dot(H, V), 0.0), F0);
+
+        float3 kS = F;
+        float3 kD = float3(1.0, 1.0, 1.0) - kS;
+        kD = kD * (1.0 - metalness);
+
+        float3 numerator = NDF * G * F;
+        float denominator = 4.0 * max(dot(N, V), 0.0) * max(dot(N, L), 0.0);
+        float3 specular = numerator / max(denominator, 0.001);
+
+        
+
+        float NdotL = max(dot(N, L), 0.0);
+
+
+        Lo += (kD * color / PI + specular) * radiance * NdotL;
+    }
+
+    float3 lit_color = Lo;
+
+    lit_color = lit_color / (lit_color + float3(1.0, 1.0, 1.0));
+    float gamma = 1.0 / 2.2;
+    lit_color = pow(lit_color, float3(gamma, gamma, gamma));
+
+    return lit_color;
+}
+
+
+float4 RayMarch(Ray r, float4 environment, float depth) {
+
+    float4 result = environment;
+
+    float t = 0;
+
+    for (int i = 0; i < _MaxSteps; i++) {
+
+        if (t >= depth || t >= _CameraFarClippingPlane) {
+            break;
+        }
+
+        float3 p = r.origin + r.direction * t;
+
+        HitInfo scene_result =  SceneFunction(p);
+        
+        float dst = scene_result.dst;
+        Shape shape = scene_result.shape;
+
+        if (dst < 0.001) {
+
+            result = float4(CalculateLighting(p, shape), 1);
+
+            break;
+        }
+
+        t += dst / _Precision;
+    }
+
+    
+    return result;
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID) {
+    uint width, height;
+    Destination.GetDimensions(width, height);
+
+    float2 uv = id.xy / float2(width, height) * 2 - 1;
+    
+    Ray ray = CreateCameraRay(uv);
+
+    float depth = LinearEyeDepth(_DepthTexture[id.xy].x);
+    depth *= length(ray.direction);
+
+    ray.direction = normalize(ray.direction);
+
+    Destination[id.xy] = RayMarch(ray, Source[id.xy], depth);
+
+}
